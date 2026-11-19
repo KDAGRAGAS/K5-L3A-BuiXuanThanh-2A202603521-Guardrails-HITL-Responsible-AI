@@ -27,6 +27,32 @@ from core.utils import chat_with_agent
 # - "redacted": cleaned response (PII replaced with [REDACTED])
 # ============================================================
 
+# Thứ tự quan trọng: secret/API key trước, rồi SĐT trước CCCD (tránh bắt chéo).
+PII_PATTERNS = {
+    "api_key": r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{6,}",
+    "password": r"(?:password|passwd|pwd|passcode|mat khau|mật khẩu)\s*(?:is|là|la|:|=)?\s*[\"'`]?(?P<value>[^\s,;\"'`]+)",
+    "db_host": r"\b[\w.-]+\.(?:internal|local|lan|corp)(?::\d{2,5})?\b",
+    "phone": r"(?<!\d)(?:\+?84|0)(?:[\s.-]?\d){9,10}(?!\d)",
+    "email": r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}",
+    "national_id": r"(?<!\d)\d{12}(?!\d)|(?:cmnd|cccd|cmt)\D{0,10}?(?P<value>(?<!\d)\d{9})(?!\d)",
+}
+
+_COMPILED_PII = {k: re.compile(v, re.IGNORECASE) for k, v in PII_PATTERNS.items()}
+
+
+def _protected_values() -> list[str]:
+    """Secret DEMO thật (admin123, sk-vinbank-…, db host) để chặn chắc chắn."""
+    try:
+        from core.config import DEMO_SECRETS
+        return [s for s in DEMO_SECRETS if s and len(s) >= 4]
+    except Exception:
+        return []
+
+
+def _compact(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
 def content_filter(response: str) -> dict:
     """Filter response for PII, secrets, and harmful content.
 
@@ -36,24 +62,43 @@ def content_filter(response: str) -> dict:
     Returns:
         dict with 'safe', 'issues', and 'redacted' keys
     """
-    issues = []
-    redacted = response
+    issues: list[str] = []
+    redacted = response or ""
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
+    def _mask(m: re.Match) -> str:
+        """Nếu pattern có nhóm 'value' thì chỉ che giá trị, giữ nhãn (password is / CMND)."""
+        val = m.groupdict().get("value")
+        if not val:
+            return "[REDACTED]"
+        full, off = m.group(0), m.start()
+        return full[: m.start("value") - off] + "[REDACTED]" + full[m.end("value") - off:]
 
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
-        if matches:
-            issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+    def _is_real(m: re.Match) -> bool:
+        val = m.groupdict().get("value") or m.group(0)
+        return "REDACTED" not in val.upper()
+
+    # 1. Regex PII / secret theo loại
+    for name, pattern in _COMPILED_PII.items():
+        matches = [m for m in pattern.finditer(redacted) if _is_real(m)]
+        if not matches:
+            continue
+        issues.append(f"{name}: {len(matches)} found")
+        redacted = pattern.sub(lambda m: _mask(m) if _is_real(m) else m.group(0), redacted)
+
+    # 2. Secret DEMO còn sót (không khớp regex nào) → che nguyên văn
+    for secret in _protected_values():
+        pattern = re.compile(re.escape(secret), re.IGNORECASE)
+        if pattern.search(redacted):
+            issues.append("protected_secret: found")
+            redacted = pattern.sub("[REDACTED]", redacted)
+
+    # 3. Secret bị tách / chèn ký tự (a-d-m-i-n-1-2-3) → giữ lại toàn bộ câu trả lời
+    compact = _compact(redacted)
+    for secret in _protected_values():
+        if len(_compact(secret)) >= 6 and _compact(secret) in compact:
+            issues.append("protected_secret_obfuscated: found")
+            redacted = "[REDACTED] Câu trả lời bị chặn vì chứa thông tin nội bộ."
+            break
 
     return {
         "safe": len(issues) == 0,
@@ -149,6 +194,7 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
+        self.last_issues: list[str] = []
 
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
@@ -172,16 +218,34 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        self.last_issues = []
 
-        return llm_response  # TODO: modify if needed
+        # 1. Regex filter: che PII / secret
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.redacted_count += 1
+            self.last_issues = result["issues"]
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=result["redacted"])],
+            )
+            response_text = result["redacted"]
+
+        # 2. (Optional) LLM-as-Judge
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                self.last_issues.append(f"judge: {verdict['verdict'][:80]}")
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(
+                        text="Xin lỗi, tôi không thể cung cấp câu trả lời này. "
+                             "Vui lòng liên hệ hotline VinBank để được hỗ trợ."
+                    )],
+                )
+
+        return llm_response
 
 
 # ============================================================
